@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include "readline.h"
 
 #define MAXLINE 15000
@@ -25,7 +26,11 @@ extern char **environ;
 struct clientData
 {
     clientData(int _id, int _sockfd, char *_ip, int _port, vector < pair<int, int > > _pipeCounter):id(_id), sockfd(_sockfd), ip(_ip), port(_port), pipeCounter(_pipeCounter) {}
-
+    
+    bool operator < (const clientData& a) const {
+        return id < a.id;
+    }
+    
     int id, sockfd, port;
     char *ip, name[MAXLINE], *env[MAXLINE];
     vector < pair<int, int> > pipeCounter;
@@ -250,6 +255,8 @@ int main(int argc, char *argv[], char *envp[])
             clients.back().env[0] = new char[MAXLINE];
             strcpy(clients.back().env[0], "PATH=bin:.");
             
+            sort(clients.begin(), clients.end());
+            
             write(connfd, welcome, strlen(welcome));
 
             snprintf(enter, sizeof(enter), "*** User '(no name)' entered from %s/%d. ***\n", ip, port);    
@@ -384,7 +391,9 @@ int main(int argc, char *argv[], char *envp[])
                     {
                         char message[MAXLINE] = "\0";
                         char temp[MAXLINE];
+                        
                         strcat(message, "<ID>\t<nickname>\t<IP/port>\t<indicate me>\n");
+                        
                         for(int j = 0; j < clients.size(); j++)
                         {
                             if(clients[i].sockfd == clients[j].sockfd)
@@ -795,4 +804,3 @@ int main(int argc, char *argv[], char *envp[])
     
     return 0;
 }
-
