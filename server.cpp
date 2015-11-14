@@ -15,21 +15,26 @@
 #define MAXLINE 15000
 #define MAX_CMD_NUM 15000
 #define MAX_CMD_LEN 300
-#define MAX_CLIENT_NUM 100
+#define MAX_CLIENT_NUM 50
+#define MAX_PUBLIC_PIPE 100
 
 using namespace std;
 
+extern char **environ;
+
 struct clientData
 {
-    clientData(int _id, int _sockfd, char *_ip, int _port, struct sockaddr_in _sockaddr, char *_name, vector < pair<int, int > > _pipeCounter):id(_id), sockfd(_sockfd), ip(_ip), port(_port), sockaddr(_sockaddr), name(_name), pipeCounter(_pipeCounter) {} 
-    
-    int id;
-    int sockfd;
-    char *ip;
-    int port;
-    struct sockaddr_in sockaddr;
-    char *name;
-    vector < pair<int, int > > pipeCounter;
+    clientData(int _id, int _sockfd, char *_ip, int _port, vector < pair<int, int > > _pipeCounter):id(_id), sockfd(_sockfd), ip(_ip), port(_port), pipeCounter(_pipeCounter) {}
+
+    int id, sockfd, port;
+    char *ip, name[MAXLINE], *env[MAXLINE];
+    vector < pair<int, int> > pipeCounter;
+};
+
+struct pipe
+{
+    int readfd, writefd;
+    bool exist;
 };
 
 void broadcast(const vector <struct clientData> &clients, char *message)
@@ -38,14 +43,14 @@ void broadcast(const vector <struct clientData> &clients, char *message)
         write(clients[i].sockfd, message, strlen(message));
 }
 
-int execute(char *command[], int readfd, int& stdout, int& stderr)
+// read from readfd, stdout and stderr will be set when return
+// return 0 if succeed, return 1 if error, return -1 if fail  
+int execute(char *command[], char *env[], int readfd, int& stdout, int& stderr)
 {
     int pipes[2], pipes2[2], status;
     
     pipe(pipes);
     pipe(pipes2);
-    
-    //printf("Open fd: %d %d\n", pipes[0], pipes[1]);
 
     if( fork() == 0 )
     {
@@ -58,6 +63,8 @@ int execute(char *command[], int readfd, int& stdout, int& stderr)
         close(pipes2[0]);
         close(pipes2[1]);
         
+        environ = env;
+        
         if(execvp(command[0], command) < 0)    // exec fail
             exit(-1); 
     }
@@ -66,29 +73,32 @@ int execute(char *command[], int readfd, int& stdout, int& stderr)
         
     close(pipes[1]);
     close(pipes2[1]);
-           
-    //printf("exec exit code: %d\n", WEXITSTATUS(status));
-        
-    if(status == 0)                           // exec succeed
-    {
+    
+    for(int i = 0; command[i] != NULL; i++)
+        delete [] command[i];
+    
+    // exec succeed
+    if(status == 0) {
         stdout = pipes[0];
         stderr = pipes2[0];
         return 0; 
-    }                 
-    else if(WEXITSTATUS(status) == 255)       // exec fail
-    {
+    }       
+    // exec fail          
+    else if(WEXITSTATUS(status) == 255) {
         close(pipes[0]);
         close(pipes2[0]);
         return -1;
     } 
-    else                                      // exec error
-    { 
+    // exec error
+    else { 
         stdout = pipes[0];
         stderr = pipes2[0];
         return 1;
     }               
 }
 
+// check numbered-pipe                                       
+// if there's no any counter's count equals to zero then return -1, else return new readfd 
 int checkCounter(vector< pair<int, int> >& pipeCounter)
 {
     char output[MAXLINE];
@@ -96,7 +106,6 @@ int checkCounter(vector< pair<int, int> >& pipeCounter)
     bool newPipe = false;
     
     for(int i = 0; i < pipeCounter.size(); i++)
-    {
         if(pipeCounter[i].first == 0)
         {
             if(!newPipe) {
@@ -109,7 +118,6 @@ int checkCounter(vector< pair<int, int> >& pipeCounter)
             close(pipeCounter[i].second);
             pipeCounter.erase(pipeCounter.begin() + i--);
         }
-    }
         
     if(newPipe) {
         close(merge[1]); 
@@ -119,14 +127,44 @@ int checkCounter(vector< pair<int, int> >& pipeCounter)
         return -1;     
 }
 
+void error_cmd_handler(struct clientData& client, char *cmd, char *arg, int readfd, int mergefd)
+{
+    char error[MAXLINE];                        
+    snprintf(error, sizeof(error), "Unknown command: [%s].\n", cmd);
+    write(client.sockfd, error, strlen(error));  
+    
+    if(!strcmp(arg, cmd))
+        for(int i = 0; i < client.pipeCounter.size(); i++)
+            client.pipeCounter[i].first += 1;
+    
+    // ls |1
+    // ctt
+    // cat      
+    if(!strcmp(arg, cmd) && mergefd != -1) 
+        client.pipeCounter.push_back(make_pair(1, readfd));
+    else if(readfd != 0) 
+        close(readfd);
+}
+
+// read from src and write to dst
+void read_write(int src, int dst)
+{
+    char buffer[MAXLINE];
+    
+    int n = read(src, buffer, sizeof(buffer));
+    buffer[n] = 0;
+    write(dst, buffer, strlen(buffer));
+    
+    close(src);
+}
+
 int main(int argc, char *argv[], char *envp[])
 {
     int listenfd, connfd, maxfd, nready, clientID[MAX_CLIENT_NUM];
     struct sockaddr_in server_addr;
     fd_set allset, rset;
     vector <struct clientData> clients;
-    
-    memset(clientID, -1, sizeof(clientID));
+    struct pipe publicPipe[MAX_PUBLIC_PIPE + 1];
     
     if(argc != 2) {
         printf("Usage: ./server <port>\n");
@@ -156,13 +194,18 @@ int main(int argc, char *argv[], char *envp[])
     maxfd = listenfd;
     FD_ZERO(&allset);
     FD_SET(listenfd, &allset);
+    
+    for(int i = 0; i <= MAX_PUBLIC_PIPE; i++)
+        publicPipe[i].exist = false;
+        
+    memset(clientID, -1, sizeof(clientID));
 
     while(1)
     {
         rset = allset;
         nready = select(maxfd + 1, &rset, NULL, NULL, NULL);
-        
-        // listen fd
+
+        // listen scoket
         if(FD_ISSET(listenfd, &rset))    
         {
             int id, port;
@@ -173,14 +216,16 @@ int main(int argc, char *argv[], char *envp[])
             "****************************************\n"
             "** Welcome to the information server. **\n"
             "****************************************\n";
-            char enter[100];
             char prompt[] = "% ";
-            char name[] = "no name";
+            char name[] = "(no name)";
+            char enter[MAXLINE];
+            char home[MAXLINE] = "";
             vector < pair<int, int > > pipeCounter;
 
             len = sizeof(clientaddr);
             connfd = accept(listenfd, (struct sockaddr *) &clientaddr, &len);
             
+            // search smallest unused id
             for(int i = 1; i <= MAX_CLIENT_NUM; i++)
                 if(clientID[i] == -1) {
                     id = i;
@@ -190,33 +235,43 @@ int main(int argc, char *argv[], char *envp[])
                 
             inet_ntop(AF_INET, &clientaddr.sin_addr, ip, sizeof(ip));
             port = ntohs(clientaddr.sin_port);
-
-            clients.push_back(clientData(id, connfd, ip, port, clientaddr, name, pipeCounter));
-               
+            
+            clients.push_back(clientData(id, connfd, ip, port, pipeCounter));  
+            strcpy(clients.back().name, "(no name)");        
             FD_SET(connfd, &allset);
+            
+            // change directory to ~/ras
+            strcat(home, getenv("HOME"));
+            strcat(home, "/ras");
+            chdir(home); 
+            
+            // set PATH
+            memset(clients.back().env, 0, sizeof(clients.back().env));
+            clients.back().env[0] = new char[MAXLINE];
+            strcpy(clients.back().env[0], "PATH=bin:.");
             
             write(connfd, welcome, strlen(welcome));
 
-            snprintf(enter, sizeof(enter), "*** User '(no name)' entered from %s/%d. ***\n%% "
-            , inet_ntop(AF_INET, &clientaddr.sin_addr, ip, sizeof(ip))
-            , ntohs(clientaddr.sin_port));
-            
+            snprintf(enter, sizeof(enter), "*** User '(no name)' entered from %s/%d. ***\n", ip, port);    
             broadcast(clients, enter);
+            
+            write(connfd, prompt, strlen(prompt));
 
             if(connfd > maxfd)
                 maxfd = connfd;
+                
             if(--nready <= 0)
                 continue;
         }
+
         // check all clients
         for(int i = 0; i < clients.size(); i++)
         {
             if(FD_ISSET(clients[i].sockfd, &rset))
             {
-                int n;
+                int n, connfd = clients[i].sockfd;
                 char prompt[] = "% ";
                 char buffer[MAXLINE];
-                int connfd = clients[i].sockfd;
                 
                 if( (n = readline(connfd, buffer, MAXLINE)) > 0 )
                 {
@@ -240,216 +295,230 @@ int main(int argc, char *argv[], char *envp[])
                             arg[argN++] = NULL;
                     }
                         
-                    // receive exit
+                    // command "exit"
                     if(!strcmp(arg[0], "exit"))
                     {
-                        char temp[MAXLINE];
-                        snprintf(temp, sizeof(temp), "*** User '%s' left. ***\n%% ", clients[i].name);
-                        clientID[clients[i].id] = -1;
+                        char leave[MAXLINE];
+                        snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[i].name);
+                        broadcast(clients, leave);
+                        
                         close(clients[i].sockfd);
                         FD_CLR(clients[i].sockfd, &allset);
+                        clientID[clients[i].id] = -1;
+                        for(int j = 0; clients[i].env[j] != NULL; j++)
+                            delete [] clients[i].env[j];
                         clients.erase(clients.begin() + i);
-                        broadcast(clients, temp);
-                         if(--nready <= 0)
-                            break;
-                        else
-                            continue;
+                        
+                        if(--nready <= 0) break;
+                        else continue;
                     }
                         
-                    // receive setenv    
-                    else if(!strcmp(arg[0], "setenv"))    
-                        setenv(arg[1], arg[2], 1);
+                    // command "setenv"    
+                    else if(!strcmp(arg[0], "setenv"))  
+                    {  
+                        char environ[MAXLINE];
+                        snprintf(environ, sizeof(environ), "%s=%s", arg[1], arg[2]);
+                        
+                        for(int j = 0; j < MAXLINE; j++)
+                        {
+                            if(clients[i].env[j] != NULL)
+                            {
+                                char *pch;
+                                char temp[MAXLINE]; 
+                                strcpy(temp, clients[i].env[j]);  
+                                
+                                pch = strtok(temp, "=");
+                                if(!strcmp(pch, arg[1]))
+                                {
+                                    strcpy(clients[i].env[j], environ);
+                                    break;
+                                }
+                            }     
+                            else 
+                            {
+                                clients[i].env[j] = new char[MAXLINE]; 
+                                strcpy(clients[i].env[j], environ);
+                                break;
+                            }
+                        }
+                    }
                     
-                    // receive printenv
+                    // command "printenv"
                     else if(!strcmp(arg[0], "printenv"))    
                     {
-                        if(argN == 3)         // print specific environment variable
+                        // print specific environment variable
+                        if(argN == 3)         
                         {
-                            char output[MAXLINE];
-                            snprintf(output, sizeof(output), "%s=%s\n", arg[1], getenv(arg[1]));
-                            write(clients[i].sockfd, output, strlen(output));
+                            char message[MAXLINE];
+                            
+                            for(int j = 0; clients[i].env[j] != NULL; j++)
+                            {
+                                char *pch;
+                                char temp[MAXLINE];          
+                                       
+                                strcpy(temp, clients[i].env[j]);        
+                                pch = strtok(temp, "=");
+                                    
+                                if(!strcmp(pch, arg[1])) {
+                                    snprintf(message, sizeof(message), "%s\n", clients[i].env[j]);
+                                    write(connfd, message, strlen(message));
+                                    break;
+                                }
+                            }    
                         }
-                        else if(argN == 2)    // print all environment variable
+                        // print all environment variable
+                        else if(argN == 2)    
                         {
-                            char output[MAXLINE] = "\0";
+                            char message[MAXLINE] = "";
                             char temp[MAXLINE];
-                            for (int i = 0; envp[i] != NULL; i++) {
-                                snprintf(temp, sizeof(temp), "%s\n", envp[i]);
-                                strcat(output, temp);
+                            for (int j = 0; clients[i].env[j] != NULL; j++) {
+                                snprintf(temp, sizeof(temp), "%s\n", clients[i].env[j]);
+                                strcat(message, temp);
                             } 
-                            write(clients[i].sockfd, output, strlen(output));
+                            write(connfd, message, strlen(message));
                         }    
                     }
+                    
                     // command "who" 
                     else if(!strcmp(arg[0], "who")) 
                     {
-                        char online[MAXLINE] = "\0";
+                        char message[MAXLINE] = "\0";
                         char temp[MAXLINE];
+                        strcat(message, "<ID>\t<nickname>\t<IP/port>\t<indicate me>\n");
                         for(int j = 0; j < clients.size(); j++)
                         {
                             if(clients[i].sockfd == clients[j].sockfd)
                                 snprintf(temp, sizeof(temp), "%d\t%s\t%s/%d\t<-me\n", clients[i].id, clients[i].name, clients[i].ip, clients[i].port);
                             else 
-                                snprintf(temp, sizeof(temp), "%d\t%s\t%s/%d\t\n", clients[j].id, clients[j].name, clients[j].ip, clients[j].port);
-                            
-                            strcat(online, temp);
+                                snprintf(temp, sizeof(temp), "%d\t%s\t%s/%d\t\n", clients[j].id, clients[j].name, clients[j].ip, clients[j].port);    
+                            strcat(message, temp);
                         }
-                        write(clients[i].sockfd, online, strlen(online));
+                        write(connfd, message, strlen(message));
                     }
+                    
                     // command "name"
                     else if(!strcmp(arg[0], "name"))
                     {
                         bool unique = true;
-                        char ip[INET_ADDRSTRLEN];
                         
+                        // check if name already exist
                         for(int j = 0; j < clients.size(); j++)
-                        {
                             if(arg[1] != NULL && !strcmp(clients[j].name, arg[1])) {
                                 unique = false;
                                 break;
                             }
-                        }
                         
+                        // name already exist
                         if(!unique)
                         {
                             char error[MAXLINE];
-                            snprintf(error, sizeof(error), "%% *** User '%s' already exists. ***\n", arg[1]);
+                            snprintf(error, sizeof(error), "*** User '%s' already exists. ***\n", arg[1]);
                             write(clients[i].sockfd, error, strlen(error));
                         }
-                        else if(arg[1] != NULL)    // name no empty
+                        // name is not empty
+                        else if(arg[1] != NULL)    
                         {
-                            char temp[MAXLINE];
-                            snprintf(temp, sizeof(temp), "*** User from %s/%d is named '%s'. ***\n%% ", clients[i].ip, clients[i].port, arg[1]);
-                            broadcast(clients, temp);
-                            clients[i].name = arg[1];
+                            char message[MAXLINE];
+                            snprintf(message, sizeof(message), "*** User from %s/%d is named '%s'. ***\n", clients[i].ip, clients[i].port, arg[1]);
+                            broadcast(clients, message);
+                            strcpy(clients[i].name, arg[1]);
                         }
                     }
+                    
                     // command "tell <id> <message>"
                     else if(!strcmp(arg[0], "tell")) 
                     {
                         char message[MAXLINE];
-                        char temp[MAXLINE];
+                        char temp[MAXLINE] = "";
+                        char error[MAXLINE];
                         int id = atoi(arg[1]);
                         
-                        if(clientID[id] == -1)
+                        if(id <= 0)
                         {
-                            snprintf(temp, sizeof(temp), "*** Error: user #%d does not exist yet. ***\n", id);
-                            write(clients[i].sockfd, temp, strlen(temp));
+                            char error[] = "*** Error: Invalid ID. ***\n";
+                            write(clients[i].sockfd, error, strlen(error));
+                        }    
+                        else if(clientID[id] == -1)
+                        {
+                            snprintf(error, sizeof(error), "*** Error: user #%d does not exist yet. ***\n", id);
+                            write(clients[i].sockfd, error, strlen(error));
                         }
                         else 
                         {
-                            if((pch = strtok(text, " ")))    // tell
-                                if((pch = strtok(NULL, " ")))    // id
-                                    if((pch = strtok(NULL, "\r\n")))     // message
-                                        strcpy(message, pch);
-                            snprintf(temp, sizeof(temp), "*** %s told you ***: %s\n%% ", clients[i].name, message);
-                            write(clientID[id], temp, strlen(temp));
+                            pch = strtok(text, " ");   
+                            pch = strtok(NULL, " ");   
+                            if((pch = strtok(NULL, "\r\n")))    
+                                strcpy(temp, pch);
+                            snprintf(message, sizeof(message), "*** %s told you ***: %s\n", clients[i].name, temp);
+                            write(clientID[id], message, strlen(message));
                         }
                     }
+                    
                     // command "yell <message>"
                     else if(!strcmp(arg[0], "yell")) 
                     {
                         char message[MAXLINE];
-                        char temp[MAXLINE];
-                        int id = atoi(arg[1]);
+                        char temp[MAXLINE] = "";
                         
-                        if((pch = strtok(text, " ")))    // yell
-                            if((pch = strtok(NULL, "\r\n")))    // message
-                                strcpy(message, pch);
-                        snprintf(temp, sizeof(temp), "*** %s yelled ***: %s\n%% ", clients[i].name, message);
-                        broadcast(clients, temp);
+                        pch = strtok(text, " ");  
+                        if((pch = strtok(NULL, "\r\n")))   
+                            strcpy(temp, pch);
+                        snprintf(message, sizeof(message), "*** %s yelled ***: %s\n", clients[i].name, temp);
+                        broadcast(clients, message);
                     }
-   
+                    
+                    // shell command
                     else 
                     for(int j = 0; j < argN; j++)
                     {
-                        if(arg[j] == NULL)    // last command
+                        // last command
+                        if(arg[j] == NULL)    
                         {
                             char output[MAXLINE];
+                            char cmd[MAXLINE] = "";
 
                             command[commandN] = NULL;
                             commandN = 0;
                             
-                            // check numbered-pipe
-                            // if there's no zero then return -1, else return new readfd
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
+                            
                             if( (fd = checkCounter(clients[i].pipeCounter)) != -1 )
                                 readfd = fd;
-                            
-                            // read from readfd, stdout and stderr will be set when return
-                            // return 0 if succeed, return 1 if error, return -1 if fail   
-                            if( execute(command, readfd, stdout, stderr) < 0 ) 
+  
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
                             {
-                                char error[MAXLINE];                        
-                                snprintf(error, sizeof(error), "Unknown command: [%s].\n", command[0]);
-                                write(connfd, error, strlen(error));  
-                                
-                                for(int i = 0; i < clients[i].pipeCounter.size(); i++)
-                                    clients[i].pipeCounter[i].first += 1;
-                                
-                                // ls |1
-                                // ctt
-                                // cat      
-                                if(command[0] != NULL && !strcmp(arg[0], command[0]) && fd != -1) 
-                                    clients[i].pipeCounter.push_back(make_pair(1, readfd));
-                                else if(readfd != 0) 
-                                    close(readfd);
-                                    
-                                for(int k = 0; command[k] != NULL; k++)
-                                    delete [] command[k];
-
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
                                 break;
                             }
                             
-                            for(int k = 0; command[k] != NULL; k++)
-                                delete [] command[k];
-                            
-                            if(readfd != 0)    
+                            if(readfd != 0) 
                                 close(readfd);
-                            
-                            readfd = stdout;
-
-                            n = read(stderr, output, sizeof(output));
-                            output[n] = 0;                    
-                            write(connfd, output, strlen(output));
-                            n = read(stdout, output, sizeof(output));
-                            output[n] = 0;                    
-                            write(connfd, output, strlen(output));
-                            
-                            close(stderr);
-                            close(stdout);
+                                
+                            read_write(stderr, connfd);
+                            read_write(stdout, connfd);
                         }
-                        else if(!strcmp(arg[j], ">"))    // redirect stdout to file
+                        
+                        // redirect stdout to file
+                        else if(!strcmp(arg[j], ">"))    
                         {
-                            char output[MAXLINE];
-     
+                            char output[MAXLINE]; 
+                            char cmd[MAXLINE] = "";
+
                             command[commandN] = NULL;
                             commandN = 0;
                             
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
+
                             if( (fd = checkCounter(clients[i].pipeCounter)) != -1 )
                                 readfd = fd;
                             
-                            if( execute(command, readfd, stdout, stderr) < 0 ) 
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
                             {
-                                char error[MAXLINE];
-                                snprintf(error, sizeof(error), "Unknown command: [%s].\n", command[0]);
-                                write(connfd, error, strlen(error)); 
-                                
-                                for(int i = 0; i < clients[i].pipeCounter.size(); i++)
-                                    clients[i].pipeCounter[i].first += 1;
-                                
-                                if(command[0] != NULL && !strcmp(arg[0], command[0]) && fd != -1) 
-                                    clients[i].pipeCounter.push_back(make_pair(1, readfd));
-                                else if(readfd != 0) 
-                                    close(readfd);
-                                    
-                                for(int k = 0; command[k] != NULL; k++)
-                                    delete [] command[k];     
-                                                               
-                                break;   
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
+                                break;
                             }
-                            
-                            for(int k = 0; command[k] != NULL; k++)
-                                delete [] command[k];
                             
                             if(readfd != 0)    
                                 close(readfd);
@@ -457,9 +526,7 @@ int main(int argc, char *argv[], char *envp[])
                             FILE *fp = fopen(arg[j+1], "w");
                             
                             if(fp) {           
-                                n = read(stdout, output, sizeof(output));
-                                output[n] = 0;                    
-                                write(fileno(fp), output, strlen(output));
+                                read_write(stdout, fileno(fp));
                                 fclose(fp);
                             }
                             else {
@@ -468,92 +535,61 @@ int main(int argc, char *argv[], char *envp[])
                                 write(connfd, error, strlen(error));
                             }
                             
-                            n = read(stderr, output, sizeof(output));
-                            output[n] = 0;                    
-                            write(connfd, output, strlen(output));
-
-                            close(stdout);
-                            close(stderr);
+                            read_write(stderr, connfd);
                             
                             break;
                         }
-                        else if(!strcmp(arg[j], "|"))    // pipe stdout to next command 
+                        
+                        // pipe stdout to next command 
+                        else if(!strcmp(arg[j], "|"))    
                         { 
                             char output[MAXLINE];
-                            
+                            char cmd[MAXLINE] = "";
+
                             command[commandN] = NULL;
                             commandN = 0;
                             
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
+
                             if( (fd = checkCounter(clients[i].pipeCounter)) != -1 )
                                 readfd = fd;
                                
-                            if( execute(command, readfd, stdout, stderr) < 0 ) 
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
                             {
-                                char error[MAXLINE];
-                                snprintf(error, sizeof(error), "Unknown command: [%s].\n", command[0]);
-                                write(connfd, error, strlen(error)); 
-                                
-                                for(int i = 0; i < clients[i].pipeCounter.size(); i++)
-                                    clients[i].pipeCounter[i].first += 1;
-                                    
-                                if(command[0] != NULL && !strcmp(arg[0], command[0]) && fd != -1) 
-                                    clients[i].pipeCounter.push_back(make_pair(1, readfd));
-                                else if(readfd != 0) 
-                                    close(readfd);
-                                    
-                                for(int k = 0; command[k] != NULL; k++)
-                                    delete [] command[k];
-                                
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
                                 break;
                             }
-                            
-                            for(int k = 0; command[k] != NULL; k++)
-                                delete [] command[k];
-                            
+
                             if(readfd != 0)    
                                 close(readfd);
                             
                             readfd = stdout; 
                             
-                            n = read(stderr, output, sizeof(output));
-                            output[n] = 0;                    
-                            write(connfd, output, strlen(output));
-                            
-                            close(stderr);
+                            read_write(stderr, connfd);
                         }
-                        else if(arg[j][0] == '|')    // pipe stdout to next N line command 
+                        
+                        // pipe stdout to next N line command 
+                        else if(arg[j][0] == '|')    
                         {
                             char output[MAXLINE];
+                            char cmd[MAXLINE] = "";
                             int number = 0;
-                            
+
                             command[commandN] = NULL;
                             commandN = 0;
+                            
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
                             
                             if( (fd = checkCounter(clients[i].pipeCounter)) != -1 )
                                 readfd = fd;
 
-                            if( execute(command, readfd, stdout, stderr) < 0 ) 
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
                             {
-                                char error[MAXLINE];
-                                snprintf(error, sizeof(error), "Unknown command: [%s].\n", command[0]);
-                                write(connfd, error, strlen(error)); 
-                                
-                                for(int i = 0; i < clients[i].pipeCounter.size(); i++)
-                                    clients[i].pipeCounter[i].first += 1;
-                                    
-                                if(command[0] != NULL && !strcmp(arg[0], command[0]) && fd != -1) 
-                                    clients[i].pipeCounter.push_back(make_pair(1, readfd));
-                                else if(readfd != 0) 
-                                    close(readfd);
-                                    
-                                for(int k = 0; command[k] != NULL; k++)
-                                    delete [] command[k];
-                                    
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
                                 break;
                             }
-                            
-                            for(int k = 0; command[k] != NULL; k++)
-                                delete [] command[k];
                             
                             if(readfd != 0)    
                                 close(readfd);
@@ -567,49 +603,34 @@ int main(int argc, char *argv[], char *envp[])
                                     if( (number = atoi(pch)) > 0 )
                                         clients[i].pipeCounter.push_back(make_pair(number, stderr)); 
                             }
-                            else {
-                                n = read(stderr, output, sizeof(output));
-                                output[n] = 0;                    
-                                write(connfd, output, strlen(output));      
-                                close(stderr);
-                            }
+                            else 
+                                read_write(stderr, connfd);
                                  
                             break;          
                         }
-                        else if(arg[j][0] == '!')    // pipe stderr to next N line command 
+                        
+                        // pipe stderr to next N line command 
+                        else if(arg[j][0] == '!')    
                         {
                             char output[MAXLINE];
+                            char cmd[MAXLINE] = "";
                             int number = 0;
-                            
+
                             command[commandN] = NULL;
                             commandN = 0;
+                            
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
                             
                             if( (fd = checkCounter(clients[i].pipeCounter)) != -1)
                                 readfd = fd;
 
-                            if( execute(command, readfd, stdout, stderr) < 0 ) 
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
                             {
-                                char error[MAXLINE];
-                                snprintf(error, sizeof(error), "Unknown command: [%s].\n", command[0]);
-                                write(connfd, error, strlen(error));  
-                                
-                                for(int i = 0; i < clients[i].pipeCounter.size(); i++)
-                                    clients[i].pipeCounter[i].first += 1;
-                                    
-                                if(command[0] != NULL && !strcmp(arg[0], command[0]) && fd != -1) 
-                                    clients[i].pipeCounter.push_back(make_pair(1, readfd));
-                                else if(readfd != 0) 
-                                    close(readfd);
-                                
-                                for(int k = 0; command[k] != NULL; k++)
-                                    delete [] command[k];       
-                                                             
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
                                 break;
                             }
-                            
-                            for(int k = 0; command[k] != NULL; k++)
-                                delete [] command[k];    
-                                                    
+
                             if(readfd != 0)    
                                 close(readfd);
                             
@@ -622,14 +643,120 @@ int main(int argc, char *argv[], char *envp[])
                                     if( (number = atoi(pch)) > 0 )
                                         clients[i].pipeCounter.push_back(make_pair(number, stdout));
                             }
-                            else {    
-                                n = read(stdout, output, sizeof(output));
-                                output[n] = 0;                    
-                                write(connfd, output, strlen(output)); 
-                                close(stdout);
-                            }
+                            else  
+                                read_write(stdout, connfd);
                                  
                             break;          
+                        }
+                        
+                        // pipe to public pipe
+                        else if(arg[j][0] == '>')    
+                        {
+                            char output[MAXLINE];
+                            char cmd[MAXLINE] = "";
+                            int number = 0;
+
+                            command[commandN] = NULL;
+                            commandN = 0;
+                            
+                            if(command[0] != NULL)
+                                strcpy(cmd, command[0]);
+
+                            if( (fd = checkCounter(clients[i].pipeCounter)) != -1)
+                                readfd = fd;
+                                
+                            if(arg[j+1] != NULL && arg[j+1][0] == '<') {
+                                if((pch = strtok(arg[j+1], "<"))) 
+                                    if( (number = atoi(pch)) > 0 )
+                                    {
+                                        if(publicPipe[number].exist)
+                                        {
+                                            publicPipe[number].exist = false;
+                                            
+                                            char message[MAXLINE];
+                                            pch = strtok(text, "\r\n");
+                                            snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                            broadcast(clients, message);
+                                            
+                                            readfd = publicPipe[number].readfd;
+                                        }
+                                        else 
+                                        {
+                                            char error[MAXLINE];
+                                            snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
+                                            broadcast(clients, error);    
+                                        }
+                                    }
+                            }
+
+                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
+                            {
+                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
+                                break;
+                            }
+   
+                            if(readfd != 0)    
+                                close(readfd);
+                            
+                            if((pch = strtok(arg[j], ">")))
+                                if( (number = atoi(pch)) > 0 )
+                                {
+                                    int pipes[2];
+                                    char message[MAXLINE];
+                                    
+                                    pipe(pipes);
+
+                                    if(!publicPipe[number].exist)
+                                    {
+                                        publicPipe[number].exist = true;
+                                        publicPipe[number].readfd = pipes[0];
+                                        publicPipe[number].writefd = pipes[1];
+                                        
+                                        read_write(stderr, pipes[1]);
+                                        read_write(stdout, pipes[1]);
+                                        close(pipes[1]);
+
+                                        pch = strtok(text, "\r\n");
+                                        snprintf(message, sizeof(message), "*** %s (#%d) just piped '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                        broadcast(clients, message);
+                                    }
+                                    else
+                                    {
+                                        char error[MAXLINE];
+                                        snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
+                                        broadcast(clients, error);
+                                    }
+                                }
+                                 
+                            break;          
+                        }
+                        
+                        // get input from public pipe
+                        else if(arg[j][0] == '<')    
+                        {
+                            int number = 0;
+
+                            if((pch = strtok(arg[j], "<")))
+                                if( (number = atoi(pch)) > 0 )
+                                {
+                                    if(publicPipe[number].exist)
+                                    {
+                                        publicPipe[number].exist = false;
+                                        
+                                        char message[MAXLINE];
+                                        pch = strtok(text, "\r\n");
+                                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                        broadcast(clients, message);
+                                        
+                                        readfd = publicPipe[number].readfd;
+                                    }
+                                    else 
+                                    {
+                                        char error[MAXLINE];
+                                        snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
+                                        broadcast(clients, error);    
+                                    }
+                                }
                         }
                         else 
                         {
@@ -649,13 +776,16 @@ int main(int argc, char *argv[], char *envp[])
                 // client close connection
                 else
                 {
-                    char temp[MAXLINE];
-                    snprintf(temp, sizeof(temp), "*** User '%s' left. ***\n%% ", clients[i].name);
-                    clientID[clients[i].id] = -1;
+                    char leave[MAXLINE];
+                    snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[i].name);
+                    broadcast(clients, leave);
+                    
                     close(clients[i].sockfd);
                     FD_CLR(clients[i].sockfd, &allset);
+                    clientID[clients[i].id] = -1;
+                    for(int j = 0; clients[i].env[j] != NULL; j++)
+                        delete [] clients[i].env[j];
                     clients.erase(clients.begin() + i);
-                    broadcast(clients, temp);
                 }
                 if(--nready <= 0)
                     break;
