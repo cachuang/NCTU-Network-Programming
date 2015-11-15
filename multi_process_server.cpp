@@ -19,18 +19,20 @@
 #define MAXLINE 15000
 #define MAX_CMD_NUM 15000
 #define MAX_CMD_LEN 300
-#define MAX_SHM_SIZE 1000
 #define MAX_CLIENT_NUM 30
 #define MAX_PUBLIC_PIPE 1000
-#define PIPEFIFO "../npfifo"
+#define SIGUSR_SEM "SIGUSR semaphore"
+#define PIPE_SEM "public pipe semaphore"
+#define PIPEFIFO "../npFIFO"
 
 using namespace std;
 
 extern char **environ;
+int sigusrfd, client_shm_id, sigusr_shm_id, pipe_shm_id;
 char *sigusr_message;
-int sigusrfd;
-int client_shm_id, sigusr_shm_id, pipe_shm_id;
-sem_t *sem, *pipe_sem;
+struct clientData *clients;
+struct publicPipeData *publicPipe;
+sem_t *sigusr_sem, *pipe_sem;
 
 struct clientData
 {
@@ -47,21 +49,32 @@ struct publicPipeData
 
 void sigint_handler(int signal)
 {
+    shmdt(clients);
+    shmdt(sigusr_message);
+    shmdt(publicPipe);
     shmctl(client_shm_id, IPC_RMID, NULL);
     shmctl(sigusr_shm_id, IPC_RMID, NULL);
     shmctl(pipe_shm_id, IPC_RMID, NULL);
     
-    sem_close(sem);
+    sem_close(sigusr_sem);
     sem_close(pipe_sem);
-    sem_unlink("12312313");
+    sem_unlink(SIGUSR_SEM);
+    sem_unlink(PIPE_SEM);
     
     exit(1);
 }
 
 void sigusr_handler(int signal)
 {
-    if(signal == SIGUSR1)
-        write(sigusrfd, sigusr_message, strlen(sigusr_message));
+    write(sigusrfd, sigusr_message, strlen(sigusr_message));
+}
+
+void sigchld_handler(int signal)
+{
+    while(waitpid(-1, NULL, WNOHANG))
+        if(errno == ECHILD)  break;
+
+    return;
 }
 
 void fifo_handler(int sig)
@@ -74,24 +87,18 @@ void fifo_handler(int sig)
     return;
 }
 
-void sigchld_handler(int signal)
-{
-    while(waitpid(-1, NULL, WNOHANG))
-        if(errno == ECHILD)  break;
-
-    return;
-}
-
 void broadcast(struct clientData *clients, char *message)
 {
     // protect share memory sigusr_message
-    //sem_wait(sem);
+    sem_wait(sigusr_sem);
+    
     strcpy(sigusr_message, message);
     
     for(int i = 1; i <= MAX_CLIENT_NUM; i++)
         if(clients[i].exist)
             kill(clients[i].pid, SIGUSR1);
-    //sem_post(sem);
+            
+    sem_post(sigusr_sem);
 }
 
 // read from readfd, stdout and stderr will be set when return
@@ -223,37 +230,55 @@ int main(int argc, char *argv[], char *envp[])
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if( (listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket Error");
+        perror("socket error");
         exit(errno);
     }
 
     if( bind(listenfd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind Error");
+        perror("bind error");
         exit(errno);
     }
 
     if( listen(listenfd, 20) < 0 ) {
-        perror("Listen Error");
+        perror("listen error");
         exit(errno);
     }
     
     // create share memory and semaphore
-    client_shm_id = shmget(IPC_PRIVATE, (MAX_CLIENT_NUM + 1) * sizeof(struct clientData), IPC_CREAT | 0600);
-    sigusr_shm_id = shmget(IPC_PRIVATE, MAXLINE * sizeof(char), IPC_CREAT | 0600);
-    pipe_shm_id = shmget(IPC_PRIVATE, MAX_PUBLIC_PIPE * sizeof(struct publicPipeData), IPC_CREAT | 0600);
-    sem = sem_open ("npserver_sem", O_CREAT | O_EXCL, 0600, 1);  
-    pipe_sem = sem_open ("12312313", O_CREAT | O_EXCL, 0600, 1); 
-    if(pipe_sem == SEM_FAILED)
-        perror("pipe_sem error");
+    if( (client_shm_id = shmget(IPC_PRIVATE, (MAX_CLIENT_NUM + 1) * sizeof(struct clientData), IPC_CREAT | IPC_EXCL | 0600)) < 0 ) {
+        perror("[shmget error]");
+        shmctl(client_shm_id, IPC_RMID, NULL);
+        exit(errno);    
+    }
+    if( (sigusr_shm_id = shmget(IPC_PRIVATE, MAXLINE * sizeof(char), IPC_CREAT | IPC_EXCL | 0600)) < 0 ) {
+        perror("[shmget error]");
+        shmctl(sigusr_shm_id, IPC_RMID, NULL);
+        exit(errno);    
+    }
+    if( (pipe_shm_id = shmget(IPC_PRIVATE, MAX_PUBLIC_PIPE * sizeof(struct publicPipeData), IPC_CREAT | IPC_EXCL | 0600)) < 0 ) {
+        perror("[shmget error]");
+        shmctl(pipe_shm_id, IPC_RMID, NULL);
+        exit(errno);    
+    }  
+    if( (sigusr_sem = sem_open (SIGUSR_SEM, O_CREAT | O_EXCL, 0600, 1)) == SEM_FAILED ) {
+        perror("[sem_open error]");
+        sem_unlink(SIGUSR_SEM);
+        exit(errno);
+    }
+    if( (pipe_sem = sem_open (PIPE_SEM, O_CREAT | O_EXCL, 0600, 1)) == SEM_FAILED ) {
+        perror("[sem_open error]");
+        sem_unlink(PIPE_SEM);
+        exit(errno);
+    }
     
-    struct clientData* clients = (struct clientData *) shmat(client_shm_id, NULL, 0);
-    struct publicPipeData* publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
+    clients = (struct clientData *) shmat(client_shm_id, NULL, 0);
+    publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
     
     for(int i = 0; i <= MAX_CLIENT_NUM; i++)
         clients[i].exist = false;
         
     for(int i = 0; i < MAX_PUBLIC_PIPE; i++)
-       publicPipe[i].exist = false;
+        publicPipe[i].exist = false;
  
     signal(SIGCHLD, sigchld_handler);
     signal(SIGINT, sigint_handler);
@@ -267,7 +292,7 @@ int main(int argc, char *argv[], char *envp[])
         
         len = sizeof(clientaddr);
         connfd = accept(listenfd, (struct sockaddr *) &clientaddr, &len);
-        if(errno == EINTR)  continue;
+        if(errno == EINTR) continue;
         
         inet_ntop(AF_INET, &clientaddr.sin_addr, ip, sizeof(ip));
         port = ntohs(clientaddr.sin_port);
@@ -305,17 +330,17 @@ int main(int argc, char *argv[], char *envp[])
             signal(SIGUSR1, sigusr_handler);
             
             // attach share memory
-            struct clientData* clients = (struct clientData*) shmat(client_shm_id, NULL, 0);
+            clients = (struct clientData *) shmat(client_shm_id, NULL, 0);
             sigusr_message = (char *) shmat(sigusr_shm_id, NULL, 0);
-            struct publicPipeData* publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
+            publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
             
             // change directory to ~/ras
             strcat(home, getenv("HOME"));
             strcat(home, "/ras");
             chdir(home); 
             
-            //clearenv();
-            // set PATH
+            // clear environment variables and set PATH
+            clearenv();
             setenv("PATH", "bin:.", 1);            
  
             write(connfd, welcome, strlen(welcome));
@@ -345,15 +370,15 @@ int main(int argc, char *argv[], char *envp[])
                         arg[argN++] = NULL;
                 }
                     
-                // receive exit
+                // command "exit"
                 if(!strcmp(arg[0], "exit"))
                     break;
                     
-                // receive setenv    
+                // command "setenv"    
                 else if(!strcmp(arg[0], "setenv"))    
                     setenv(arg[1], arg[2], 1);
                 
-                // receive printenv
+                // command "printenv"
                 else if(!strcmp(arg[0], "printenv"))    
                 {
                     if(argN == 3)         // print specific environment variable
@@ -364,7 +389,7 @@ int main(int argc, char *argv[], char *envp[])
                     }
                     else if(argN == 2)    // print all environment variable
                     {
-                        char output[MAXLINE] = "\0";
+                        char output[MAXLINE] = "";
                         char temp[MAXLINE];
                         for (int i = 0; environ[i] != NULL; i++) {
                             snprintf(temp, sizeof(temp), "%s\n", environ[i]);
@@ -373,9 +398,11 @@ int main(int argc, char *argv[], char *envp[])
                         write(connfd, output, strlen(output));
                     }    
                 }
+                
+                // command "who"
                 else if(!strcmp(arg[0], "who"))    
                 {
-                    char message[MAXLINE] = "\0";
+                    char message[MAXLINE] = "";
                     char temp[MAXLINE];
                     
                     strcat(message, "<ID>\t<nickname>\t<IP/port>\t<indicate me>\n");
@@ -400,8 +427,8 @@ int main(int argc, char *argv[], char *envp[])
                     bool unique = true;
                     
                     // check if name already exist
-                    for(int j = 1; j <= MAX_CLIENT_NUM; j++)
-                        if(clients[j].exist && arg[1] != NULL && !strcmp(clients[j].name, arg[1]))                {
+                    for(int i = 1; i <= MAX_CLIENT_NUM; i++)
+                        if(clients[i].exist && arg[1] != NULL && !strcmp(clients[i].name, arg[1]))                {
                             unique = false;
                             break;
                         }
@@ -418,18 +445,14 @@ int main(int argc, char *argv[], char *envp[])
                     {
                         char message[MAXLINE];
                         snprintf(message, sizeof(message), "*** User from %s/%d is named '%s'. ***\n", clients[id].ip, clients[id].port, arg[1]);
-                        // TODO: need semaphore
-                        broadcast(clients, message);
                         strcpy(clients[id].name, arg[1]);
+                        broadcast(clients, message);
                     }
                 }
                 
                 // command "tell <id> <message>"
                 else if(!strcmp(arg[0], "tell")) 
                 {
-                    char message[MAXLINE];
-                    char temp[MAXLINE] = "";
-                    char error[MAXLINE];
                     int targetID = atoi(arg[1]);
                     
                     if(targetID <= 0)
@@ -439,20 +462,24 @@ int main(int argc, char *argv[], char *envp[])
                     }    
                     else if(!clients[targetID].exist)
                     {
+                        char error[MAXLINE];
                         snprintf(error, sizeof(error), "*** Error: user #%d does not exist yet. ***\n", id);
                         write(connfd, error, strlen(error));
                     }
                     else 
                     {
+                        char message[MAXLINE];
+                        char temp[MAXLINE] = "";
+                        
                         pch = strtok(text, " ");   
                         pch = strtok(NULL, " ");   
                         if((pch = strtok(NULL, "\r\n")))    
                             strcpy(temp, pch);
                         snprintf(message, sizeof(message), "*** %s told you ***: %s\n", clients[id].name, temp);
-                        sem_wait(sem);
+                        sem_wait(sigusr_sem);
                         strcpy(sigusr_message, message);
                         kill(clients[targetID].pid, SIGUSR1);
-                        sem_post(sem);
+                        sem_post(sigusr_sem);
                     }
                 }
                 
@@ -472,7 +499,8 @@ int main(int argc, char *argv[], char *envp[])
                 else 
                 for(int i = 0; i < argN; i++)
                 {
-                    if(arg[i] == NULL)    // last command
+                    // last command
+                    if(arg[i] == NULL)    
                     {
                         char output[MAXLINE];
                         char cmd[MAXLINE] = "";
@@ -498,7 +526,9 @@ int main(int argc, char *argv[], char *envp[])
                         read_write(stderr, connfd);
                         read_write(stdout, connfd);
                     }
-                    else if(!strcmp(arg[i], ">"))    // redirect stdout to file
+                    
+                    // redirect stdout to file
+                    else if(!strcmp(arg[i], ">"))    
                     {
                         char output[MAXLINE];
                         char cmd[MAXLINE] = "";
@@ -537,7 +567,9 @@ int main(int argc, char *argv[], char *envp[])
                         
                         break;
                     }
-                    else if(!strcmp(arg[i], "|"))    // pipe stdout to next command 
+                    
+                    // pipe stdout to next command 
+                    else if(!strcmp(arg[i], "|"))    
                     { 
                         char output[MAXLINE];
                         char cmd[MAXLINE] = "";
@@ -564,7 +596,9 @@ int main(int argc, char *argv[], char *envp[])
                         
                         read_write(stderr, connfd);
                     }
-                    else if(arg[i][0] == '|')    // pipe stdout to next N line command 
+                    
+                    // pipe stdout to next N line command 
+                    else if(arg[i][0] == '|')    
                     {
                         char output[MAXLINE];
                         char cmd[MAXLINE] = "";
@@ -602,7 +636,9 @@ int main(int argc, char *argv[], char *envp[])
                              
                         break;          
                     }
-                    else if(arg[i][0] == '!')    // pipe stderr to next N line command 
+                    
+                    // pipe stderr to next N line command 
+                    else if(arg[i][0] == '!')    
                     {
                         char output[MAXLINE];
                         char cmd[MAXLINE] = "";
@@ -656,6 +692,33 @@ int main(int argc, char *argv[], char *envp[])
 
                         if( (fd = checkCounter(pipeCounter)) != -1)
                             readfd = fd;
+                            
+                        if(arg[i+1] != NULL && arg[i+1][0] == '<')     
+                            if((pch = strtok(arg[i+1], "<")))
+                                if( (number = atoi(pch)) > 0 )
+                                {
+                                    char message[MAXLINE];
+                                    
+                                    sem_wait(pipe_sem);
+                                    if(publicPipe[number].exist)
+                                    {
+                                        publicPipe[number].exist = false;
+                                        sem_post(pipe_sem);
+              
+                                        readfd = open(publicPipe[number].name, O_RDONLY);
+                                        
+                                        pch = strtok(text, "\r\n");
+                                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                        broadcast(clients, message);
+                                    }
+                                    else 
+                                    {
+                                        sem_post(pipe_sem);
+                                        char error[MAXLINE];
+                                        snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
+                                        broadcast(clients, error);    
+                                    }
+                                }    
 
                         if( execute(command, readfd, stdout, stderr) < 0 )
                         {
@@ -677,22 +740,23 @@ int main(int argc, char *argv[], char *envp[])
                                     publicPipe[number].exist = true;
                                     sem_post(pipe_sem);
                                     
-                                    char fifo_name[MAXLINE];
-                                    snprintf(fifo_name, sizeof(fifo_name), "%s%d", PIPEFIFO, number);                          
-                                    strcpy(publicPipe[number].name, fifo_name);
+                                    char fname[MAXLINE];
+                                    snprintf(fname, sizeof(fname), "%s%d", PIPEFIFO, number);                          
+                                    strcpy(publicPipe[number].name, fname);
 
                                     signal(SIGCHLD, fifo_handler);
-                                    // open FIFO in writeonly will block untill another process
-                                    // open FIFO for read, so fork a child process to wait
+                                    
+                                    // open FIFO in writeonly will block until another process
+                                    // open FIFO for read, so fork a child process to wait                          
                                     if( fork() == 0 )
                                     {
-                                        mkfifo(fifo_name, 0600);
-                                        int fifofd = open(fifo_name, O_WRONLY);
+                                        mkfifo(fname, 0600);
+                                        int fifofd = open(fname, O_WRONLY);
                                         
                                         read_write(stderr, fifofd);
                                         read_write(stdout, fifofd);
                                         close(fifofd);
-                                        unlink(PIPEFIFO);
+                                        unlink(fname);
                                         
                                         exit(0);
                                     }
@@ -705,6 +769,7 @@ int main(int argc, char *argv[], char *envp[])
                                 }
                                 else
                                 {
+                                    sem_post(pipe_sem);
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
                                     broadcast(clients, error);
@@ -722,24 +787,23 @@ int main(int argc, char *argv[], char *envp[])
                         if((pch = strtok(arg[i], "<")))
                             if( (number = atoi(pch)) > 0 )
                             {
+                                char message[MAXLINE];
+                                
                                 sem_wait(pipe_sem);
                                 if(publicPipe[number].exist)
                                 {
                                     publicPipe[number].exist = false;
                                     sem_post(pipe_sem);
-
+          
+                                    readfd = open(publicPipe[number].name, O_RDONLY);
                                     
-                                    int fifofd = open(publicPipe[number].name, O_RDONLY);
-
-                                    char message[MAXLINE];
                                     pch = strtok(text, "\r\n");
                                     snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
                                     broadcast(clients, message);
-                                    
-                                    readfd = fifofd;
                                 }
                                 else 
                                 {
+                                    sem_post(pipe_sem);
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
                                     broadcast(clients, error);    
@@ -762,12 +826,18 @@ int main(int argc, char *argv[], char *envp[])
                     
                 write(connfd, prompt, strlen(prompt)); 
             }
-                // client close connection
-                char leave[MAXLINE];
-                snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[id].name);
-                broadcast(clients, leave);    
+                // client disconnect
                 clients[id].exist = false;
                 close(connfd);
+                shmdt(clients);
+                shmdt(sigusr_message);
+                shmdt(publicPipe);
+                sem_close(sigusr_sem);
+                sem_close(pipe_sem);
+                char leave[MAXLINE];
+                snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[id].name);
+                broadcast(clients, leave); 
+
                 exit(0);
         }
             close(connfd);
