@@ -20,7 +20,7 @@
 #define MAX_CMD_NUM 15000
 #define MAX_CMD_LEN 300
 #define MAX_CLIENT_NUM 30
-#define MAX_PUBLIC_PIPE 1000
+#define MAX_PUBLIC_PIPE 100
 #define SIGUSR_SEM "SIGUSR semaphore"
 #define PIPE_SEM "public pipe semaphore"
 #define PIPEFIFO "../npFIFO"
@@ -73,16 +73,6 @@ void sigchld_handler(int signal)
 {
     while(waitpid(-1, NULL, WNOHANG))
         if(errno == ECHILD)  break;
-
-    return;
-}
-
-void fifo_handler(int sig)
-{
-    while(waitpid(-1, NULL, WNOHANG))
-        if(errno == ECHILD)  break;
-        
-    signal(SIGCHLD, SIG_DFL);
 
     return;
 }
@@ -708,7 +698,7 @@ int main(int argc, char *argv[], char *envp[])
                                         readfd = open(publicPipe[number].name, O_RDONLY);
                                         
                                         pch = strtok(text, "\r\n");
-                                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[id].name, clients[id].id, pch);
                                         broadcast(clients, message);
                                     }
                                     else 
@@ -716,7 +706,7 @@ int main(int argc, char *argv[], char *envp[])
                                         sem_post(pipe_sem);
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                        broadcast(clients, error);    
+                                        write(connfd, error, strlen(error));    
                                     }
                                 }    
 
@@ -743,25 +733,30 @@ int main(int argc, char *argv[], char *envp[])
                                     char fname[MAXLINE];
                                     snprintf(fname, sizeof(fname), "%s%d", PIPEFIFO, number);                          
                                     strcpy(publicPipe[number].name, fname);
-
-                                    signal(SIGCHLD, fifo_handler);
                                     
                                     // open FIFO in writeonly will block until another process
-                                    // open FIFO for read, so fork a child process to wait                          
+                                    // open FIFO for read, so fork a child process to wait  
+                                    // use double fork to prevent zombie process                        
                                     if( fork() == 0 )
                                     {
-                                        mkfifo(fname, 0600);
-                                        int fifofd = open(fname, O_WRONLY);
-                                        
-                                        read_write(stderr, fifofd);
-                                        read_write(stdout, fifofd);
-                                        close(fifofd);
-                                        unlink(fname);
-                                        
-                                        exit(0);
+                                        if ( fork() == 0 )
+                                        {
+                                            mkfifo(fname, 0600);
+                                            int fifofd = open(fname, O_WRONLY);
+                                            
+                                            read_write(stderr, fifofd);
+                                            read_write(stdout, fifofd);
+                                            close(fifofd);
+                                            unlink(fname);
+                                            
+                                            exit(0);
+                                        }
+                                        else 
+                                            exit(0);
                                     }
                                     else 
                                     {
+                                        wait(NULL);
                                         pch = strtok(text, "\r\n");
                                         snprintf(message, sizeof(message), "*** %s (#%d) just piped '%s' ***\n", clients[id].name, clients[id].id, pch);
                                         broadcast(clients, message);
@@ -772,7 +767,7 @@ int main(int argc, char *argv[], char *envp[])
                                     sem_post(pipe_sem);
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
-                                    broadcast(clients, error);
+                                    write(connfd, error, strlen(error));
                                 }
                             }
                              
@@ -781,14 +776,16 @@ int main(int argc, char *argv[], char *envp[])
                     
                     // get input from public pipe
                     else if(arg[i][0] == '<')    
-                    {
+                    {                        
+                        char message[MAXLINE];
                         int number = 0;
+                        
+                        pch = strtok(text, "\r\n");
+                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[id].name, clients[id].id, pch);
 
                         if((pch = strtok(arg[i], "<")))
                             if( (number = atoi(pch)) > 0 )
-                            {
-                                char message[MAXLINE];
-                                
+                            {  
                                 sem_wait(pipe_sem);
                                 if(publicPipe[number].exist)
                                 {
@@ -796,21 +793,49 @@ int main(int argc, char *argv[], char *envp[])
                                     sem_post(pipe_sem);
           
                                     readfd = open(publicPipe[number].name, O_RDONLY);
-                                    
-                                    pch = strtok(text, "\r\n");
-                                    snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
-                                    broadcast(clients, message);
+
+                                    if(arg[i+1] == NULL)
+                                    {
+                                        char output[MAXLINE];
+                                        char cmd[MAXLINE] = "";
+
+                                        command[commandN] = NULL;
+                                        commandN = 0;
+                                        
+                                        if(command[0] != NULL)
+                                            strcpy(cmd, command[0]);
+                                        
+                                        if( (fd = checkCounter(pipeCounter)) != -1 )
+                                            readfd = fd;
+                 
+                                        if( execute(command, readfd, stdout, stderr) < 0 )
+                                        {
+                                            error_cmd_handler(connfd, pipeCounter, cmd, arg[0], readfd, fd);
+                                            break;
+                                        }                        
+                                        
+                                        if(readfd != 0)    
+                                            close(readfd);
+                                        
+                                        read_write(stderr, connfd);
+                                        read_write(stdout, connfd);
+                                        
+                                        broadcast(clients, message);
+                                        
+                                        break;
+                                    }
+                                    else
+                                        broadcast(clients, message);
                                 }
                                 else 
                                 {
                                     sem_post(pipe_sem);
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                    broadcast(clients, error);    
+                                    write(connfd, error, strlen(error));
                                 }
                             }
                     }
-
                     else 
                     {
                         command[commandN] = new char[MAX_CMD_LEN];
@@ -827,6 +852,9 @@ int main(int argc, char *argv[], char *envp[])
                 write(connfd, prompt, strlen(prompt)); 
             }
                 // client disconnect
+                char leave[MAXLINE];
+                snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[id].name);
+                broadcast(clients, leave); 
                 clients[id].exist = false;
                 close(connfd);
                 shmdt(clients);
@@ -834,9 +862,6 @@ int main(int argc, char *argv[], char *envp[])
                 shmdt(publicPipe);
                 sem_close(sigusr_sem);
                 sem_close(pipe_sem);
-                char leave[MAXLINE];
-                snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[id].name);
-                broadcast(clients, leave); 
 
                 exit(0);
         }

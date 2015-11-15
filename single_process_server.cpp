@@ -693,7 +693,7 @@ int main(int argc, char *argv[], char *envp[])
                                         {
                                             char error[MAXLINE];
                                             snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                            broadcast(clients, error);    
+                                            write(connfd, error, strlen(error));   
                                         }
                                     }
                             }
@@ -733,7 +733,7 @@ int main(int argc, char *argv[], char *envp[])
                                     {
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
-                                        broadcast(clients, error);
+                                        write(connfd, error, strlen(error));
                                     }
                                 }
                                  
@@ -763,7 +763,7 @@ int main(int argc, char *argv[], char *envp[])
                                     {
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                        broadcast(clients, error);    
+                                        write(connfd, error, strlen(error));    
                                     }
                                 }
                         }
