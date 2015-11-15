@@ -3,10 +3,13 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/stat.h>
+#include <semaphore.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <csignal>
@@ -18,13 +21,16 @@
 #define MAX_CMD_LEN 300
 #define MAX_SHM_SIZE 1000
 #define MAX_CLIENT_NUM 30
+#define MAX_PUBLIC_PIPE 1000
+#define PIPEFIFO "../npfifo"
 
 using namespace std;
 
 extern char **environ;
 char *sigusr_message;
 int sigusrfd;
-int client_shm_id, sigusr_shm_id;
+int client_shm_id, sigusr_shm_id, pipe_shm_id;
+sem_t *sem, *pipe_sem;
 
 struct clientData
 {
@@ -33,10 +39,21 @@ struct clientData
     bool exist;
 };
 
+struct publicPipeData
+{
+    char name[MAXLINE];
+    bool exist;
+};
+
 void sigint_handler(int signal)
 {
     shmctl(client_shm_id, IPC_RMID, NULL);
     shmctl(sigusr_shm_id, IPC_RMID, NULL);
+    shmctl(pipe_shm_id, IPC_RMID, NULL);
+    
+    sem_close(sem);
+    sem_close(pipe_sem);
+    sem_unlink("12312313");
     
     exit(1);
 }
@@ -45,6 +62,16 @@ void sigusr_handler(int signal)
 {
     if(signal == SIGUSR1)
         write(sigusrfd, sigusr_message, strlen(sigusr_message));
+}
+
+void fifo_handler(int sig)
+{
+    while(waitpid(-1, NULL, WNOHANG))
+        if(errno == ECHILD)  break;
+        
+    signal(SIGCHLD, SIG_DFL);
+
+    return;
 }
 
 void sigchld_handler(int signal)
@@ -57,11 +84,14 @@ void sigchld_handler(int signal)
 
 void broadcast(struct clientData *clients, char *message)
 {
+    // protect share memory sigusr_message
+    //sem_wait(sem);
     strcpy(sigusr_message, message);
     
     for(int i = 1; i <= MAX_CLIENT_NUM; i++)
         if(clients[i].exist)
             kill(clients[i].pid, SIGUSR1);
+    //sem_post(sem);
 }
 
 // read from readfd, stdout and stderr will be set when return
@@ -207,14 +237,23 @@ int main(int argc, char *argv[], char *envp[])
         exit(errno);
     }
     
-    // create share memory
+    // create share memory and semaphore
     client_shm_id = shmget(IPC_PRIVATE, (MAX_CLIENT_NUM + 1) * sizeof(struct clientData), IPC_CREAT | 0600);
     sigusr_shm_id = shmget(IPC_PRIVATE, MAXLINE * sizeof(char), IPC_CREAT | 0600);
+    pipe_shm_id = shmget(IPC_PRIVATE, MAX_PUBLIC_PIPE * sizeof(struct publicPipeData), IPC_CREAT | 0600);
+    sem = sem_open ("npserver_sem", O_CREAT | O_EXCL, 0600, 1);  
+    pipe_sem = sem_open ("12312313", O_CREAT | O_EXCL, 0600, 1); 
+    if(pipe_sem == SEM_FAILED)
+        perror("pipe_sem error");
     
     struct clientData* clients = (struct clientData *) shmat(client_shm_id, NULL, 0);
+    struct publicPipeData* publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
     
     for(int i = 0; i <= MAX_CLIENT_NUM; i++)
         clients[i].exist = false;
+        
+    for(int i = 0; i < MAX_PUBLIC_PIPE; i++)
+       publicPipe[i].exist = false;
  
     signal(SIGCHLD, sigchld_handler);
     signal(SIGINT, sigint_handler);
@@ -224,7 +263,7 @@ int main(int argc, char *argv[], char *envp[])
         socklen_t len;
         struct sockaddr_in clientaddr;
         char ip[INET_ADDRSTRLEN];
-        int port, id;
+        int id, port;
         
         len = sizeof(clientaddr);
         connfd = accept(listenfd, (struct sockaddr *) &clientaddr, &len);
@@ -232,8 +271,7 @@ int main(int argc, char *argv[], char *envp[])
         
         inet_ntop(AF_INET, &clientaddr.sin_addr, ip, sizeof(ip));
         port = ntohs(clientaddr.sin_port);
-        
-        
+             
         for(id = 1; id <= MAX_CLIENT_NUM; id++) {
             if(!clients[id].exist) {
                 clients[id].exist = true;
@@ -255,6 +293,7 @@ int main(int argc, char *argv[], char *envp[])
             char prompt[] = "% ";
             char buffer[MAXLINE];
             char home[MAXLINE] = "";
+            char enter[MAXLINE];
             vector < pair<int, int > > pipeCounter;
                         
             close(listenfd);
@@ -268,6 +307,7 @@ int main(int argc, char *argv[], char *envp[])
             // attach share memory
             struct clientData* clients = (struct clientData*) shmat(client_shm_id, NULL, 0);
             sigusr_message = (char *) shmat(sigusr_shm_id, NULL, 0);
+            struct publicPipeData* publicPipe = (struct publicPipeData *) shmat(pipe_shm_id, NULL, 0);
             
             // change directory to ~/ras
             strcat(home, getenv("HOME"));
@@ -276,9 +316,11 @@ int main(int argc, char *argv[], char *envp[])
             
             //clearenv();
             // set PATH
-            setenv("PATH", "bin:.", 1);
-            
+            setenv("PATH", "bin:.", 1);            
+ 
             write(connfd, welcome, strlen(welcome));
+            snprintf(enter, sizeof(enter), "*** User '(no name)' entered from %s/%d. ***\n", clients[id].ip, clients[id].port);    
+            broadcast(clients, enter);       
             write(connfd, prompt, strlen(prompt));
 
             while((n = readline(connfd, buffer, MAXLINE)) > 0)
@@ -407,8 +449,10 @@ int main(int argc, char *argv[], char *envp[])
                         if((pch = strtok(NULL, "\r\n")))    
                             strcpy(temp, pch);
                         snprintf(message, sizeof(message), "*** %s told you ***: %s\n", clients[id].name, temp);
+                        sem_wait(sem);
                         strcpy(sigusr_message, message);
                         kill(clients[targetID].pid, SIGUSR1);
+                        sem_post(sem);
                     }
                 }
                 
@@ -596,6 +640,113 @@ int main(int argc, char *argv[], char *envp[])
                              
                         break;          
                     }
+                    
+                    // pipe to public pipe
+                    else if(arg[i][0] == '>')    
+                    {
+                        char output[MAXLINE];
+                        char cmd[MAXLINE] = "";
+                        int number = 0;
+
+                        command[commandN] = NULL;
+                        commandN = 0;
+                        
+                        if(command[0] != NULL)
+                            strcpy(cmd, command[0]);
+
+                        if( (fd = checkCounter(pipeCounter)) != -1)
+                            readfd = fd;
+
+                        if( execute(command, readfd, stdout, stderr) < 0 )
+                        {
+                            error_cmd_handler(connfd, pipeCounter, cmd, arg[0], readfd, fd);
+                            break;
+                        }
+
+                        if(readfd != 0)    
+                            close(readfd);
+                        
+                        if((pch = strtok(arg[i], ">")))
+                            if( (number = atoi(pch)) > 0 )
+                            {
+                                char message[MAXLINE];
+                                
+                                sem_wait(pipe_sem);
+                                if(!publicPipe[number].exist)
+                                {
+                                    publicPipe[number].exist = true;
+                                    sem_post(pipe_sem);
+                                    
+                                    char fifo_name[MAXLINE];
+                                    snprintf(fifo_name, sizeof(fifo_name), "%s%d", PIPEFIFO, number);                          
+                                    strcpy(publicPipe[number].name, fifo_name);
+
+                                    signal(SIGCHLD, fifo_handler);
+                                    // open FIFO in writeonly will block untill another process
+                                    // open FIFO for read, so fork a child process to wait
+                                    if( fork() == 0 )
+                                    {
+                                        mkfifo(fifo_name, 0600);
+                                        int fifofd = open(fifo_name, O_WRONLY);
+                                        
+                                        read_write(stderr, fifofd);
+                                        read_write(stdout, fifofd);
+                                        close(fifofd);
+                                        unlink(PIPEFIFO);
+                                        
+                                        exit(0);
+                                    }
+                                    else 
+                                    {
+                                        pch = strtok(text, "\r\n");
+                                        snprintf(message, sizeof(message), "*** %s (#%d) just piped '%s' ***\n", clients[id].name, clients[id].id, pch);
+                                        broadcast(clients, message);
+                                    }
+                                }
+                                else
+                                {
+                                    char error[MAXLINE];
+                                    snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
+                                    broadcast(clients, error);
+                                }
+                            }
+                             
+                        break;          
+                    }
+                    
+                    // get input from public pipe
+                    else if(arg[i][0] == '<')    
+                    {
+                        int number = 0;
+
+                        if((pch = strtok(arg[i], "<")))
+                            if( (number = atoi(pch)) > 0 )
+                            {
+                                sem_wait(pipe_sem);
+                                if(publicPipe[number].exist)
+                                {
+                                    publicPipe[number].exist = false;
+                                    sem_post(pipe_sem);
+
+                                    
+                                    int fifofd = open(publicPipe[number].name, O_RDONLY);
+
+                                    char message[MAXLINE];
+                                    pch = strtok(text, "\r\n");
+                                    snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
+                                    broadcast(clients, message);
+                                    
+                                    readfd = fifofd;
+                                }
+                                else 
+                                {
+                                    char error[MAXLINE];
+                                    snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
+                                    broadcast(clients, error);    
+                                }
+                            }
+                    }
+
                     else 
                     {
                         command[commandN] = new char[MAX_CMD_LEN];
@@ -612,8 +763,10 @@ int main(int argc, char *argv[], char *envp[])
                 write(connfd, prompt, strlen(prompt)); 
             }
                 // client close connection
-                if(n == 0)
-                    printf("client has closed the connection.\n");
+                char leave[MAXLINE];
+                snprintf(leave, sizeof(leave), "*** User '%s' left. ***\n", clients[id].name);
+                broadcast(clients, leave);    
+                clients[id].exist = false;
                 close(connfd);
                 exit(0);
         }
