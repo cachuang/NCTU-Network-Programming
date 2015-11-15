@@ -755,9 +755,41 @@ int main(int argc, char *argv[], char *envp[])
                                         char message[MAXLINE];
                                         pch = strtok(text, "\r\n");
                                         snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[i].name, clients[i].id, pch);
-                                        broadcast(clients, message);
                                         
                                         readfd = publicPipe[number].readfd;
+                                        
+                                        if(arg[j+1] == NULL)
+                                        {
+                                            char output[MAXLINE];
+                                            char cmd[MAXLINE] = "";
+
+                                            command[commandN] = NULL;
+                                            commandN = 0;
+                                            
+                                            if(command[0] != NULL)
+                                                strcpy(cmd, command[0]);
+                                            
+                                            if( (fd = checkCounter(clients[i].pipeCounter)) != -1 )
+                                                readfd = fd;
+                  
+                                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
+                                            {
+                                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
+                                                break;
+                                            }
+                                            
+                                            if(readfd != 0) 
+                                                close(readfd);
+                                                
+                                            read_write(stderr, connfd);
+                                            read_write(stdout, connfd);
+                                            
+                                            broadcast(clients, message);
+                                            
+                                            break;
+                                        }
+                                        else 
+                                            broadcast(clients, message);
                                     }
                                     else 
                                     {
