@@ -679,9 +679,6 @@ int main(int argc, char *argv[], char *envp[])
                         
                         if(command[0] != NULL)
                             strcpy(cmd, command[0]);
-
-                        if( (fd = checkCounter(pipeCounter)) != -1)
-                            readfd = fd;
                             
                         if(arg[i+1] != NULL && arg[i+1][0] == '<')     
                             if((pch = strtok(arg[i+1], "<")))
@@ -706,18 +703,18 @@ int main(int argc, char *argv[], char *envp[])
                                         sem_post(pipe_sem);
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                        write(connfd, error, strlen(error));    
+                                        write(connfd, error, strlen(error));   
+                                        
+                                        if(!strcmp(arg[0], command[0]))
+                                            for(int i = 0; i < pipeCounter.size(); i++)
+                                                pipeCounter[i].first += 1;
+                                                
+                                        if(readfd != 0)    
+                                            close(readfd);        
+                                                
+                                        break; 
                                     }
                                 }    
-
-                        if( execute(command, readfd, stdout, stderr) < 0 )
-                        {
-                            error_cmd_handler(connfd, pipeCounter, cmd, arg[0], readfd, fd);
-                            break;
-                        }
-
-                        if(readfd != 0)    
-                            close(readfd);
                         
                         if((pch = strtok(arg[i], ">")))
                             if( (number = atoi(pch)) > 0 )
@@ -729,6 +726,18 @@ int main(int argc, char *argv[], char *envp[])
                                 {
                                     publicPipe[number].exist = true;
                                     sem_post(pipe_sem);
+                                    
+                                    if( (fd = checkCounter(pipeCounter)) != -1)
+                                        readfd = fd;
+                                    
+                                    if( execute(command, readfd, stdout, stderr) < 0 )
+                                    {
+                                        error_cmd_handler(connfd, pipeCounter, cmd, arg[0], readfd, fd);
+                                        break;
+                                    }
+                                    
+                                    if(readfd != 0)    
+                                        close(readfd);
                                     
                                     char fname[MAXLINE];
                                     snprintf(fname, sizeof(fname), "%s%d", PIPEFIFO, number);                          
@@ -768,6 +777,15 @@ int main(int argc, char *argv[], char *envp[])
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
                                     write(connfd, error, strlen(error));
+                                    
+                                    if(!strcmp(arg[0], command[0]))
+                                        for(int i = 0; i < pipeCounter.size(); i++)
+                                            pipeCounter[i].first += 1;
+                                            
+                                    if(readfd != 0)    
+                                        close(readfd);        
+                                    
+                                    break;
                                 }
                             }
                              
@@ -777,19 +795,21 @@ int main(int argc, char *argv[], char *envp[])
                     // get input from public pipe
                     else if(arg[i][0] == '<')    
                     {                        
-                        char message[MAXLINE];
                         int number = 0;
-                        
-                        pch = strtok(text, "\r\n");
-                        snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[id].name, clients[id].id, pch);
 
                         if((pch = strtok(arg[i], "<")))
                             if( (number = atoi(pch)) > 0 )
                             {  
+                                char message[MAXLINE];
+                                pch = strtok(text, "\r\n");
+                                snprintf(message, sizeof(message), "*** %s (#%d) just received via '%s' ***\n", clients[id].name, clients[id].id, pch);
+                                
                                 sem_wait(pipe_sem);
+                                
                                 if(publicPipe[number].exist)
                                 {
                                     publicPipe[number].exist = false;
+                                    
                                     sem_post(pipe_sem);
           
                                     readfd = open(publicPipe[number].name, O_RDONLY);
@@ -833,6 +853,15 @@ int main(int argc, char *argv[], char *envp[])
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
                                     write(connfd, error, strlen(error));
+                                    
+                                    if(!strcmp(arg[0], command[0]))
+                                        for(int i = 0; i < pipeCounter.size(); i++)
+                                            pipeCounter[i].first += 1;
+                                    
+                                    if(readfd != 0)    
+                                        close(readfd);        
+                                            
+                                    break;
                                 }
                             }
                     }

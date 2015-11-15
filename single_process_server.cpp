@@ -670,9 +670,6 @@ int main(int argc, char *argv[], char *envp[])
                             
                             if(command[0] != NULL)
                                 strcpy(cmd, command[0]);
-
-                            if( (fd = checkCounter(clients[i].pipeCounter)) != -1)
-                                readfd = fd;
                                 
                             if(arg[j+1] != NULL && arg[j+1][0] == '<') {
                                 if((pch = strtok(arg[j+1], "<"))) 
@@ -693,19 +690,19 @@ int main(int argc, char *argv[], char *envp[])
                                         {
                                             char error[MAXLINE];
                                             snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                            write(connfd, error, strlen(error));   
+                                            write(connfd, error, strlen(error)); 
+                                            
+                                            if(!strcmp(arg[0], command[0]))
+                                                for(int j = 0; j < clients[i].pipeCounter.size(); j++)
+                                                    clients[i].pipeCounter[j].first += 1;
+                                            
+                                            if(readfd != 0)    
+                                                close(readfd);        
+                                                    
+                                            break;  
                                         }
                                     }
                             }
-
-                            if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
-                            {
-                                error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
-                                break;
-                            }
-   
-                            if(readfd != 0)    
-                                close(readfd);
                             
                             if((pch = strtok(arg[j], ">")))
                                 if( (number = atoi(pch)) > 0 )
@@ -721,6 +718,18 @@ int main(int argc, char *argv[], char *envp[])
                                         publicPipe[number].readfd = pipes[0];
                                         publicPipe[number].writefd = pipes[1];
                                         
+                                        if( (fd = checkCounter(clients[i].pipeCounter)) != -1)
+                                            readfd = fd;
+                                        
+                                        if( execute(command, clients[i].env, readfd, stdout, stderr) < 0 )
+                                        {
+                                            error_cmd_handler(clients[i], cmd, arg[0], readfd, fd);
+                                            break;
+                                        }
+               
+                                        if(readfd != 0)    
+                                            close(readfd);
+            
                                         read_write(stderr, pipes[1]);
                                         read_write(stdout, pipes[1]);
                                         close(pipes[1]);
@@ -734,6 +743,15 @@ int main(int argc, char *argv[], char *envp[])
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
                                         write(connfd, error, strlen(error));
+                                        
+                                        if(!strcmp(arg[0], command[0]))
+                                            for(int j = 0; j < clients[i].pipeCounter.size(); j++)
+                                                clients[i].pipeCounter[j].first += 1;
+                                                
+                                        if(readfd != 0)    
+                                            close(readfd);
+                                                
+                                        break;
                                     }
                                 }
                                  
@@ -795,7 +813,16 @@ int main(int argc, char *argv[], char *envp[])
                                     {
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                        write(connfd, error, strlen(error));    
+                                        write(connfd, error, strlen(error)); 
+                                        
+                                        if(!strcmp(arg[0], command[0]))
+                                            for(int j = 0; j < clients[i].pipeCounter.size(); j++)
+                                                clients[i].pipeCounter[j].first += 1;
+                                        
+                                        if(readfd != 0)    
+                                            close(readfd);        
+                                            
+                                        break;
                                     }
                                 }
                         }
