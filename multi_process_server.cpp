@@ -453,7 +453,7 @@ int main(int argc, char *argv[], char *envp[])
                     else if(!clients[targetID].exist)
                     {
                         char error[MAXLINE];
-                        snprintf(error, sizeof(error), "*** Error: user #%d does not exist yet. ***\n", id);
+                        snprintf(error, sizeof(error), "*** Error: user #%d does not exist yet. ***\n", targetID);
                         write(connfd, error, strlen(error));
                     }
                     else 
@@ -750,6 +750,8 @@ int main(int argc, char *argv[], char *envp[])
                                     {
                                         if ( fork() == 0 )
                                         {
+                                            close(connfd);
+                                            
                                             mkfifo(fname, 0600);
                                             int fifofd = open(fname, O_WRONLY);
                                             
