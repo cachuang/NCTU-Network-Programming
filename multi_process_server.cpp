@@ -703,7 +703,17 @@ int main(int argc, char *argv[], char *envp[])
                                         sem_post(pipe_sem);
                                         char error[MAXLINE];
                                         snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
-                                        write(connfd, error, strlen(error));   
+                                        write(connfd, error, strlen(error)); 
+
+                                        if(arg[i] != NULL && arg[i][0] == '>') 
+                                            if((pch = strtok(arg[i], ">"))) 
+                                                if( (number = atoi(pch)) > 0 )
+                                                    if(publicPipe[number].exist)
+                                                    {
+                                                        char error[MAXLINE];
+                                                        snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
+                                                        write(connfd, error, strlen(error));
+                                                    }  
                                         
                                         if(!strcmp(arg[0], command[0]))
                                             for(int i = 0; i < pipeCounter.size(); i++)
@@ -855,6 +865,16 @@ int main(int argc, char *argv[], char *envp[])
                                     char error[MAXLINE];
                                     snprintf(error, sizeof(error), "*** Error: public pipe #%d does not exist yet. ***\n", number);
                                     write(connfd, error, strlen(error));
+
+                                    if(arg[i+1] != NULL && arg[i+1][0] == '>') 
+                                        if((pch = strtok(arg[i+1], ">"))) 
+                                            if( (number = atoi(pch)) > 0 )
+                                                if(publicPipe[number].exist)
+                                                {
+                                                    char error[MAXLINE];
+                                                    snprintf(error, sizeof(error), "*** Error: public pipe #%d already exists. ***\n", number);
+                                                    write(connfd, error, strlen(error));
+                                                }
                                     
                                     if(!strcmp(arg[0], command[0]))
                                         for(int i = 0; i < pipeCounter.size(); i++)
